@@ -5,7 +5,7 @@ on:
     # 每 5 分鐘執行一次（GitHub Actions 官方建議的最短間隔，太頻繁可能不準時觸發）
     # 若 repo 是 Private，這個頻率每月約用掉 4000~8000 分鐘，會超過免費額度 2000 分鐘
     # 建議搭配 Public repo 使用（Actions 分鐘數不限額）
-    - cron: "*/5 * * * *"
+    - cron: "* * * * *"
   workflow_dispatch: {} # 允許在 GitHub 網頁上手動點擊執行，方便測試
 
 permissions:
