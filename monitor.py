@@ -1,60 +1,66 @@
 """
-戰鬥陀螺補貨/新品監控腳本
-監控 https://shop.funbox.com.tw/categories/XI/KB
-資料來源：該分類頁背後呼叫的 JSON API
-    https://shop.funbox.com.tw/category_products/XI/KB.json?limit=18&page=N
+戰鬥陀螺補貨/新品監控腳本（合併版）
+同時監控：
+1. Funbox 玩具官網（分類頁 + JSON API，能偵測新品與補貨）
+   https://shop.funbox.com.tw/categories/XI/KB
+2. 誠品線上（兩個策展頁，僅能偵測新品上架，無庫存資訊）
+   https://www.eslite.com/exhibitions/CU202608-00061
+   https://www.eslite.com/exhibitions/CU202310-00113
 
 功能：
-1. 偵測到「新商品上架」或「原本缺貨的商品補貨」時，透過 Telegram 發送通知
-2. 支援 Telegram 指令：/status（查詢現況）、/check（立即檢查）、/help（說明）
-3. 程式執行異常時會透過 Telegram 回報（有 30 分鐘冷卻機制，避免洗版）
+- 偵測到「新商品上架」或「補貨」（僅 Funbox 支援）時，透過 Telegram 通知
+- 支援 Telegram 指令：/status（查詢現況）、/check（立即檢查）、/help（說明）
+- 任一來源抓取失敗，不影響其他來源的正常運作；程式異常會透過 Telegram 回報（30 分鐘防洗版）
 """
 
 import json
 import os
+import re
 import sys
 import time
 import traceback
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 
 # ============================================================
 # 設定區
 # ============================================================
-SITE_ROOT = "https://shop.funbox.com.tw"
-API_URL_TEMPLATE = SITE_ROOT + "/category_products/XI/KB.json"
-CATEGORY_PAGE_URL = SITE_ROOT + "/categories/XI/KB"  # 純粹給通知訊息附連結用
-PAGE_LIMIT = 18  # 跟網站前端一致的每頁筆數，不用改
-
-# Telegram 設定 -> 從環境變數讀取（GitHub Actions Secrets 會注入）
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# 存放「上次看過的商品清單」的檔案
 DATA_FILE = Path(__file__).parent / "data" / "seen_products.json"
-
-# 存放「機器人狀態」的檔案（上次處理到哪則 Telegram 訊息、上次錯誤通知時間等）
 BOT_STATE_FILE = Path(__file__).parent / "data" / "bot_state.json"
-
-# 同類型錯誤通知的冷卻時間（秒），避免網站長時間故障時被訊息洗版
 ERROR_ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 分鐘
 
-# 模擬一般瀏覽器的完整 headers
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": CATEGORY_PAGE_URL,
 }
+
+# ---- Funbox 設定 ----
+FUNBOX_SITE_ROOT = "https://shop.funbox.com.tw"
+FUNBOX_API_URL = FUNBOX_SITE_ROOT + "/category_products/XI/KB.json"
+FUNBOX_CATEGORY_PAGE_URL = FUNBOX_SITE_ROOT + "/categories/XI/KB"
+FUNBOX_PAGE_LIMIT = 18
+
+# ---- 誠品設定 ----
+ESLITE_SITE_ROOT = "https://www.eslite.com"
+ESLITE_TARGET_URLS = [
+    ESLITE_SITE_ROOT + "/exhibitions/CU202608-00061",
+    ESLITE_SITE_ROOT + "/exhibitions/CU202310-00113",
+]
+ESLITE_KEYWORD_FILTER = ["戰鬥陀螺", "BEYBLADE", "beyblade"]
+ESLITE_PRODUCT_LINK_PATTERN = re.compile(r"^/product/\d+")
 
 
 # ============================================================
-# 資料存取（商品清單 + 機器人狀態）
+# 共用：資料存取
 # ============================================================
 def load_json_file(path: Path) -> dict:
     if path.exists():
@@ -69,12 +75,16 @@ def save_json_file(path: Path, data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def load_seen_products() -> dict:
-    return load_json_file(DATA_FILE)
+def load_all_seen() -> dict:
+    """回傳格式: {"funbox": {...}, "eslite": {...}}"""
+    data = load_json_file(DATA_FILE)
+    data.setdefault("funbox", {})
+    data.setdefault("eslite", {})
+    return data
 
 
-def save_seen_products(products: dict):
-    save_json_file(DATA_FILE, products)
+def save_all_seen(data: dict):
+    save_json_file(DATA_FILE, data)
 
 
 def load_bot_state() -> dict:
@@ -86,48 +96,38 @@ def save_bot_state(state: dict):
 
 
 # ============================================================
-# 商品資料抓取與解析
+# Funbox：抓取與解析
 # ============================================================
-def fetch_all_products() -> list:
-    """呼叫 JSON API，自動翻頁抓完所有商品，回傳原始商品資料 list"""
+def fetch_funbox_products() -> dict:
+    """
+    回傳格式: {商品ID(字串): {"title":..., "url":..., "price":..., "in_stock": bool}}
+    """
     all_items = []
     page = 1
-
     while True:
         resp = requests.get(
-            API_URL_TEMPLATE,
-            params={"limit": PAGE_LIMIT, "page": page},
+            FUNBOX_API_URL,
+            params={"limit": FUNBOX_PAGE_LIMIT, "page": page},
             headers=HEADERS,
             timeout=20,
         )
         resp.raise_for_status()
         items = resp.json()
-
         if not items:
             break
-
         all_items.extend(items)
         page += 1
-
-        if page > 50:  # 保險：避免無限迴圈
-            print("[警告] 已翻超過 50 頁，強制停止，請確認網站是否正常。")
+        if page > 50:
+            print("[警告][Funbox] 已翻超過 50 頁，強制停止。")
             break
 
-    return all_items
-
-
-def parse_products(raw_items: list) -> dict:
-    """
-    回傳格式: {商品ID(字串): {"title":..., "url":..., "price":..., "in_stock": bool}}
-    """
     products = {}
-    for item in raw_items:
+    for item in all_items:
         product_id = str(item.get("id"))
         title = item.get("title", "（無標題）")
         url_path = item.get("url", "")
-        full_url = SITE_ROOT + url_path if url_path.startswith("/") else url_path
+        full_url = FUNBOX_SITE_ROOT + url_path if url_path.startswith("/") else url_path
         price = item.get("price")
-
         variants = item.get("variants", [])
         in_stock = any((v.get("inventory_quantity") or 0) > 0 for v in variants)
 
@@ -138,6 +138,86 @@ def parse_products(raw_items: list) -> dict:
             "in_stock": in_stock,
         }
     return products
+
+
+# ============================================================
+# 誠品：抓取與解析
+# ============================================================
+def matches_eslite_keyword(name: str) -> bool:
+    return any(kw.lower() in name.lower() for kw in ESLITE_KEYWORD_FILTER)
+
+
+def parse_eslite_page(soup: BeautifulSoup) -> dict:
+    products = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not ESLITE_PRODUCT_LINK_PATTERN.match(href):
+            continue
+        full_url = ESLITE_SITE_ROOT + href
+
+        name = a.get_text(strip=True)
+        if not name:
+            img = a.find("img")
+            if img and img.get("alt"):
+                name = img.get("alt").strip()
+
+        if full_url not in products or (name and len(name) > len(products[full_url])):
+            if name:
+                products[full_url] = name
+            elif full_url not in products:
+                products[full_url] = full_url
+    return products
+
+
+def fetch_eslite_products() -> dict:
+    """
+    回傳格式: {商品完整網址: {"title":..., "url":..., "price": None, "in_stock": None}}
+    （誠品沒有價格與庫存資訊，price/in_stock 固定為 None，補貨偵測不適用）
+    """
+    all_products = {}
+    success_count = 0
+
+    for url in ESLITE_TARGET_URLS:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except requests.RequestException as e:
+            print(f"[警告][誠品] 抓取 {url} 失敗，略過這頁: {e}")
+            continue
+
+        success_count += 1
+        page_products = parse_eslite_page(soup)
+        for full_url, name in page_products.items():
+            if matches_eslite_keyword(name):
+                all_products[full_url] = {
+                    "title": name,
+                    "url": full_url,
+                    "price": None,
+                    "in_stock": None,
+                }
+
+    if success_count == 0:
+        raise RuntimeError(f"誠品的 {len(ESLITE_TARGET_URLS)} 個監控頁面全部抓取失敗")
+
+    return all_products
+
+
+# ============================================================
+# 來源定義：把兩個網站統一成一致的介面，方便主流程共用邏輯
+# ============================================================
+SOURCES = {
+    "funbox": {
+        "label": "Funbox",
+        "fetch": fetch_funbox_products,
+        "supports_restock": True,
+    },
+    "eslite": {
+        "label": "誠品",
+        "fetch": fetch_eslite_products,
+        "supports_restock": False,
+    },
+}
 
 
 def format_price(price):
@@ -153,9 +233,7 @@ def format_price(price):
 # Telegram 相關
 # ============================================================
 def send_telegram_message(text: str, chat_id: str = None):
-    """發送 Telegram 訊息，預設發給設定好的 TELEGRAM_CHAT_ID"""
     target_chat_id = chat_id or TELEGRAM_CHAT_ID
-
     if not TELEGRAM_BOT_TOKEN or not target_chat_id:
         print("[錯誤] 尚未設定 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，無法發送通知。")
         return
@@ -178,13 +256,8 @@ def send_telegram_message(text: str, chat_id: str = None):
 
 
 def get_telegram_updates(offset: int) -> list:
-    """
-    取得 Telegram 新訊息（指令）。
-    offset = 上次處理到的 update_id + 1，Telegram 只會回傳這之後的新訊息。
-    """
     if not TELEGRAM_BOT_TOKEN:
         return []
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     params = {"offset": offset, "timeout": 0}
     try:
@@ -196,47 +269,42 @@ def get_telegram_updates(offset: int) -> list:
             return []
         return data.get("result", [])
     except requests.RequestException as e:
-        print(f"[警告] 取得 Telegram 指令失敗（不影響本次庫存檢查）: {e}")
+        print(f"[警告] 取得 Telegram 指令失敗（不影響本次檢查）: {e}")
         return []
 
 
-def build_status_text(products: dict) -> str:
-    total = len(products)
-    in_stock_count = sum(1 for p in products.values() if p["in_stock"])
+def build_status_text(all_current: dict, fetch_errors: dict) -> str:
     now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    lines = ["📊 <b>戰鬥陀螺監控 - 目前狀態</b>", "", f"查詢時間：{now_str}"]
 
-    lines = [
-        "📊 <b>目前狀態</b>",
-        "",
-        f"追蹤商品總數：{total}",
-        f"目前有庫存：{in_stock_count}",
-        f"查詢時間：{now_str}",
-    ]
-
-    if in_stock_count > 0:
+    for key, source in SOURCES.items():
         lines.append("")
-        lines.append("有庫存的商品：")
-        for info in products.values():
-            if info["in_stock"]:
-                lines.append(f"・{info['title']}（{format_price(info['price'])}）")
+        if key in fetch_errors:
+            lines.append(f"❌ {source['label']}：本次抓取失敗（{fetch_errors[key]}）")
+            continue
+
+        products = all_current.get(key, {})
+        lines.append(f"✅ {source['label']}：{len(products)} 樣商品")
+        if source["supports_restock"]:
+            in_stock_count = sum(1 for p in products.values() if p.get("in_stock"))
+            lines.append(f"　其中有庫存：{in_stock_count}")
+            for p in products.values():
+                if p.get("in_stock"):
+                    lines.append(f"　・{p['title']}（{format_price(p.get('price'))}）")
 
     return "\n".join(lines)
 
 
 HELP_TEXT = (
     "🤖 <b>可用指令</b>\n\n"
-    "/status - 查詢目前追蹤狀態（商品總數、有庫存數量）\n"
+    "/status - 查詢兩個來源目前的追蹤狀態\n"
     "/check - 立即手動檢查一次，並回報結果\n"
     "/help - 顯示這則說明\n\n"
-    "系統平常每分鐘會自動檢查一次，有新商品上架或補貨會主動通知你，不需要手動下指令。"
+    "系統平常每分鐘會自動檢查一次，有新商品上架或補貨（僅 Funbox 支援補貨偵測）會主動通知你。"
 )
 
 
-def handle_telegram_commands(bot_state: dict, current_products: dict):
-    """
-    處理使用者傳來的 Telegram 指令。
-    只回應來自設定好的 TELEGRAM_CHAT_ID 的訊息，避免陌生人濫用你的 Bot。
-    """
+def handle_telegram_commands(bot_state: dict, all_current: dict, fetch_errors: dict):
     last_update_id = bot_state.get("last_update_id", 0)
     updates = get_telegram_updates(offset=last_update_id + 1)
 
@@ -251,7 +319,6 @@ def handle_telegram_commands(bot_state: dict, current_products: dict):
         sender_chat_id = str(message.get("chat", {}).get("id", ""))
         text = (message.get("text") or "").strip()
 
-        # 安全性：只回應設定好的那個 chat，避免其他人對你的 Bot 亂下指令
         if not TELEGRAM_CHAT_ID or sender_chat_id != str(TELEGRAM_CHAT_ID):
             print(f"[提示] 忽略來自非授權 chat_id ({sender_chat_id}) 的訊息")
             continue
@@ -259,10 +326,10 @@ def handle_telegram_commands(bot_state: dict, current_products: dict):
         command = text.split()[0].lower() if text else ""
 
         if command == "/status":
-            send_telegram_message(build_status_text(current_products))
+            send_telegram_message(build_status_text(all_current, fetch_errors))
         elif command == "/check":
             send_telegram_message("🔍 收到，正在為你檢查最新狀態...")
-            send_telegram_message(build_status_text(current_products))
+            send_telegram_message(build_status_text(all_current, fetch_errors))
         elif command in ("/help", "/start"):
             send_telegram_message(HELP_TEXT)
         elif command:
@@ -272,31 +339,30 @@ def handle_telegram_commands(bot_state: dict, current_products: dict):
 # ============================================================
 # 錯誤回報
 # ============================================================
-def report_error(bot_state: dict, error: Exception):
-    """
-    發生例外時，透過 Telegram 通知，並附上 30 分鐘冷卻機制避免洗版。
-    """
+def report_error(bot_state: dict, source_label: str, error: Exception):
     now_ts = time.time()
-    last_alert_ts = bot_state.get("last_error_alert_ts", 0)
+    cooldown_key = f"last_error_alert_ts_{source_label}"
+    last_alert_ts = bot_state.get(cooldown_key, 0)
 
     error_summary = f"{type(error).__name__}: {error}"
-    print(f"[錯誤] 程式執行異常: {error_summary}")
+    print(f"[錯誤][{source_label}] 程式執行異常: {error_summary}")
     print(traceback.format_exc())
 
     if now_ts - last_alert_ts < ERROR_ALERT_COOLDOWN_SECONDS:
-        print("[提示] 距離上次錯誤通知未滿 30 分鐘，這次不重複發送 Telegram 通知。")
-        return
+        print(f"[提示][{source_label}] 距離上次錯誤通知未滿 30 分鐘，這次不重複發送。")
+        return error_summary
 
     now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     message = (
-        "🚨 <b>監控程式發生異常</b>\n\n"
+        f"🚨 <b>{source_label} 監控發生異常</b>\n\n"
         f"時間：{now_str}\n"
         f"錯誤內容：{error_summary}\n\n"
-        "程式這次執行失敗，下一輪（約 1 分鐘後）會自動重試。\n"
-        "如果持續發生，可能是網站改版或防爬蟲機制變更，需要人工檢查。"
+        "下一輪（約 1 分鐘後）會自動重試，其他來源不受影響。\n"
+        "如果持續發生，可能是網站改版，需要人工檢查。"
     )
     send_telegram_message(message)
-    bot_state["last_error_alert_ts"] = now_ts
+    bot_state[cooldown_key] = now_ts
+    return error_summary
 
 
 # ============================================================
@@ -304,76 +370,86 @@ def report_error(bot_state: dict, error: Exception):
 # ============================================================
 def main():
     bot_state = load_bot_state()
+    all_seen = load_all_seen()
 
-    print(f"開始檢查: {CATEGORY_PAGE_URL}")
+    all_current = {}
+    fetch_errors = {}
 
-    try:
-        raw_items = fetch_all_products()
-        current_products = parse_products(raw_items)
-    except Exception as e:
-        # 抓取失敗：回報錯誤，仍然嘗試處理使用者指令（用舊資料回答 /status），最後結束並讓這次 workflow 標記失敗
-        report_error(bot_state, e)
-        old_products = load_seen_products()
-        handle_telegram_commands(bot_state, old_products)
-        save_bot_state(bot_state)
-        sys.exit(1)
+    for key, source in SOURCES.items():
+        print(f"開始檢查來源: {source['label']}")
+        try:
+            all_current[key] = source["fetch"]()
+            print(f"[{source['label']}] 抓到 {len(all_current[key])} 樣商品")
+        except Exception as e:
+            error_summary = report_error(bot_state, source["label"], e)
+            fetch_errors[key] = error_summary
+            # 這個來源這次失敗，保留上次記錄，不覆蓋、不比對新品
+            all_current[key] = all_seen.get(key, {})
 
-    print(f"目前抓到 {len(current_products)} 樣商品")
+    # 處理 Telegram 指令（用這次抓到的最新資料回答）
+    handle_telegram_commands(bot_state, all_current, fetch_errors)
 
-    # 先處理使用者指令（用最新抓到的資料回答，比較準）
-    handle_telegram_commands(bot_state, current_products)
+    # 逐一來源比對新品／補貨並發送通知
+    for key, source in SOURCES.items():
+        if key in fetch_errors:
+            continue  # 這次失敗的來源，不比對、不更新記錄
 
-    # 比對新舊清單，判斷新商品 / 補貨
-    seen_products = load_seen_products()
-    new_ids = []
-    restocked_ids = []
+        current_products = all_current[key]
+        seen_products = all_seen.get(key, {})
 
-    for pid, info in current_products.items():
-        if pid not in seen_products:
-            new_ids.append(pid)
-        else:
-            was_in_stock = seen_products[pid].get("in_stock", False)
-            if (not was_in_stock) and info["in_stock"]:
-                restocked_ids.append(pid)
+        new_ids = []
+        restocked_ids = []
 
-    if new_ids:
-        print(f"發現 {len(new_ids)} 樣新商品！")
+        for pid, info in current_products.items():
+            if pid not in seen_products:
+                new_ids.append(pid)
+            elif source["supports_restock"]:
+                was_in_stock = seen_products[pid].get("in_stock", False)
+                if (not was_in_stock) and info.get("in_stock"):
+                    restocked_ids.append(pid)
+
         for pid in new_ids:
             info = current_products[pid]
-            stock_note = "現貨" if info["in_stock"] else "目前無庫存/預購"
-            message = (
-                f"🆕 <b>發現新商品！</b>\n\n"
-                f"{info['title']}\n"
-                f"{format_price(info['price'])}（{stock_note}）\n\n"
-                f"{info['url']}"
-            )
+            if source["supports_restock"]:
+                stock_note = "現貨" if info.get("in_stock") else "目前無庫存/預購"
+                message = (
+                    f"🆕 <b>[{source['label']}] 發現新商品！</b>\n\n"
+                    f"{info['title']}\n"
+                    f"{format_price(info.get('price'))}（{stock_note}）\n\n"
+                    f"{info['url']}"
+                )
+            else:
+                message = (
+                    f"🆕 <b>[{source['label']}] 發現新商品！</b>\n\n"
+                    f"{info['title']}\n\n"
+                    f"{info['url']}"
+                )
             send_telegram_message(message)
 
-    if restocked_ids:
-        print(f"發現 {len(restocked_ids)} 樣商品補貨！")
         for pid in restocked_ids:
             info = current_products[pid]
             message = (
-                f"📦 <b>補貨通知！</b>\n\n"
+                f"📦 <b>[{source['label']}] 補貨通知！</b>\n\n"
                 f"{info['title']}\n"
-                f"{format_price(info['price'])}\n\n"
+                f"{format_price(info.get('price'))}\n\n"
                 f"{info['url']}"
             )
             send_telegram_message(message)
 
-    if not new_ids and not restocked_ids:
-        print("沒有新商品，也沒有補貨。")
+        if not new_ids and not restocked_ids:
+            print(f"[{source['label']}] 沒有新商品，也沒有補貨。")
 
-    # 這次成功執行，清掉錯誤冷卻紀錄，下次真的出錯時會立刻通知（不受舊的冷卻時間影響）
-    if "last_error_alert_ts" in bot_state:
-        del bot_state["last_error_alert_ts"]
+        # 這個來源這次成功執行，清掉它的錯誤冷卻紀錄
+        cooldown_key = f"last_error_alert_ts_{source['label']}"
+        if cooldown_key in bot_state:
+            del bot_state[cooldown_key]
 
-    save_seen_products(current_products)
+        # 更新這個來源的記錄
+        all_seen[key] = current_products
+
+    save_all_seen(all_seen)
     save_bot_state(bot_state)
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
