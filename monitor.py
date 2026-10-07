@@ -1,28 +1,21 @@
 """
-戰鬥陀螺補貨/新品監控腳本（合併版）
-同時監控：
-1. Funbox 玩具官網（分類頁 + JSON API，能偵測新品與補貨）
-   https://shop.funbox.com.tw/categories/XI/KB
-2. 誠品線上（兩個策展頁，僅能偵測新品上架，無庫存資訊）
-   https://www.eslite.com/exhibitions/CU202608-00061
-   https://www.eslite.com/exhibitions/CU202310-00113
+戰鬥陀螺補貨/新品監控腳本
+監控 Funbox 玩具官網（分類頁 + JSON API，能偵測新品與補貨）
+https://shop.funbox.com.tw/categories/XI/KB
 
 功能：
-- 偵測到「新商品上架」或「補貨」（僅 Funbox 支援）時，透過 Telegram 通知
+- 偵測到「新商品上架」或「補貨」時，透過 Telegram 通知
 - 支援 Telegram 指令：/status（查詢現況）、/check（立即檢查）、/help（說明）
-- 任一來源抓取失敗，不影響其他來源的正常運作；程式異常會透過 Telegram 回報（30 分鐘防洗版）
+- 程式異常會透過 Telegram 回報（30 分鐘防洗版）
 """
 
 import json
 import os
-import re
-import sys
 import time
 import traceback
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
 
 # ============================================================
 # 設定區
@@ -49,15 +42,6 @@ FUNBOX_API_URL = FUNBOX_SITE_ROOT + "/category_products/XI/KB.json"
 FUNBOX_CATEGORY_PAGE_URL = FUNBOX_SITE_ROOT + "/categories/XI/KB"
 FUNBOX_PAGE_LIMIT = 18
 
-# ---- 誠品設定 ----
-ESLITE_SITE_ROOT = "https://www.eslite.com"
-ESLITE_TARGET_URLS = [
-    ESLITE_SITE_ROOT + "/exhibitions/CU202608-00061",
-    ESLITE_SITE_ROOT + "/exhibitions/CU202310-00113",
-]
-ESLITE_KEYWORD_FILTER = ["戰鬥陀螺", "BEYBLADE", "beyblade"]
-ESLITE_PRODUCT_LINK_PATTERN = re.compile(r"^/product/\d+")
-
 
 # ============================================================
 # 共用：資料存取
@@ -76,10 +60,9 @@ def save_json_file(path: Path, data: dict):
 
 
 def load_all_seen() -> dict:
-    """回傳格式: {"funbox": {...}, "eslite": {...}}"""
+    """回傳格式: {"funbox": {...}}"""
     data = load_json_file(DATA_FILE)
     data.setdefault("funbox", {})
-    data.setdefault("eslite", {})
     return data
 
 
@@ -141,81 +124,13 @@ def fetch_funbox_products() -> dict:
 
 
 # ============================================================
-# 誠品：抓取與解析
-# ============================================================
-def matches_eslite_keyword(name: str) -> bool:
-    return any(kw.lower() in name.lower() for kw in ESLITE_KEYWORD_FILTER)
-
-
-def parse_eslite_page(soup: BeautifulSoup) -> dict:
-    products = {}
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not ESLITE_PRODUCT_LINK_PATTERN.match(href):
-            continue
-        full_url = ESLITE_SITE_ROOT + href
-
-        name = a.get_text(strip=True)
-        if not name:
-            img = a.find("img")
-            if img and img.get("alt"):
-                name = img.get("alt").strip()
-
-        if full_url not in products or (name and len(name) > len(products[full_url])):
-            if name:
-                products[full_url] = name
-            elif full_url not in products:
-                products[full_url] = full_url
-    return products
-
-
-def fetch_eslite_products() -> dict:
-    """
-    回傳格式: {商品完整網址: {"title":..., "url":..., "price": None, "in_stock": None}}
-    （誠品沒有價格與庫存資訊，price/in_stock 固定為 None，補貨偵測不適用）
-    """
-    all_products = {}
-    success_count = 0
-
-    for url in ESLITE_TARGET_URLS:
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=20)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-        except requests.RequestException as e:
-            print(f"[警告][誠品] 抓取 {url} 失敗，略過這頁: {e}")
-            continue
-
-        success_count += 1
-        page_products = parse_eslite_page(soup)
-        for full_url, name in page_products.items():
-            if matches_eslite_keyword(name):
-                all_products[full_url] = {
-                    "title": name,
-                    "url": full_url,
-                    "price": None,
-                    "in_stock": None,
-                }
-
-    if success_count == 0:
-        raise RuntimeError(f"誠品的 {len(ESLITE_TARGET_URLS)} 個監控頁面全部抓取失敗")
-
-    return all_products
-
-
-# ============================================================
-# 來源定義：把兩個網站統一成一致的介面，方便主流程共用邏輯
+# 來源定義：保留這個結構，之後若想再加其他網站可以直接擴充
 # ============================================================
 SOURCES = {
     "funbox": {
         "label": "Funbox",
         "fetch": fetch_funbox_products,
         "supports_restock": True,
-    },
-    "eslite": {
-        "label": "誠品",
-        "fetch": fetch_eslite_products,
-        "supports_restock": False,
     },
 }
 
@@ -297,10 +212,10 @@ def build_status_text(all_current: dict, fetch_errors: dict) -> str:
 
 HELP_TEXT = (
     "🤖 <b>可用指令</b>\n\n"
-    "/status - 查詢兩個來源目前的追蹤狀態\n"
+    "/status - 查詢目前的追蹤狀態\n"
     "/check - 立即手動檢查一次，並回報結果\n"
     "/help - 顯示這則說明\n\n"
-    "系統平常每分鐘會自動檢查一次，有新商品上架或補貨（僅 Funbox 支援補貨偵測）會主動通知你。"
+    "系統平常每分鐘會自動檢查一次，有新商品上架或補貨會主動通知你。"
 )
 
 
